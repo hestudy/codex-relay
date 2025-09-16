@@ -189,3 +189,330 @@ so that I can integrate within 0.5 day.
 1: 提供最小 Postman 集合或 curl 示例，演示鉴权、JSON Relay 调用与错误响应。
 2: 提供“常见错误与排查”小节（鉴权失败、超限、上游异常）。
 3: 演示示例在本地与云端环境均可运行通过。
+
+## 6. Epic Details — Epic 2: Streaming & Unified Errors
+
+Epic 目标
+- 实现 Codex 流式响应（SSE/分块）的稳定、低延迟透传；
+- 完善基于 TransformStream 的数据管道与回压处理；
+- 统一错误模型在流式场景下的细化与可恢复重试策略；
+- 增强观测指标，度量流式特性（首字节时间、断流率、重连/重试结果等）。
+
+Story 2.1 SSE/分块透传基础实现
+As an end-user client,
+I want stable SSE/chunked streaming from upstream via the relay,
+so that I can consume responses incrementally with low latency.
+
+验收标准
+1: 提供流式上游的稳定透传，保持事件边界与数据完整性（不拆分 UTF-8 字符，按 event 分帧）。
+2: 透传必须兼容常见浏览器与 Node 客户端（Fetch/EventSource/ReadableStream）。
+3: 在上游正常/降速/间歇性场景下，端到端可用，首字节时间可度量。
+
+Story 2.2 TransformStream 管道与回压处理
+As a performance-minded engineer,
+I want proper TransformStream and backpressure handling,
+so that the pipeline remains responsive and memory-safe.
+
+验收标准
+1: 对 Readable → Transform → Writable 管道正确连接，尊重 backpressure，避免内存膨胀。
+2: 在慢消费端下不丢事件、不阻塞上游（或按策略限速）；提供可配置的缓冲阈值与丢弃策略占位（默认关闭）。
+3: 通过性能测试验证在不同速率与网络条件下的稳定性。
+
+Story 2.3 统一错误模型（流式场景）
+As an integrator,
+I want consistent error signaling for streaming,
+so that clients can handle errors predictably.
+
+验收标准
+1: 定义流式上下文中的错误分类（可恢复/不可恢复/超时/断流/上游 4xx/5xx）。
+2: 在发生错误时提供一致的标识与追踪 ID；在头/首包或最后数据包中以约定方式传达（文档化）。
+3: 对可恢复错误支持有限次重试（指数退避），并记录重试次数与最终结果。
+
+Story 2.4 断开、超时与重连策略
+As a resilient consumer,
+I want clear behavior on disconnects, timeouts, and retries,
+so that user experience remains robust.
+
+验收标准
+1: 客户端断开时清理资源；上游断流时快速感知并按策略处理（重试或结束）。
+2: 可配置的请求超时与空闲超时；对长时间静默提供心跳或 keep-alive 选项（文档化权衡）。
+3: 文档示例展示断开/重连/超时的推荐客户端处理范式（含 EventSource/Fetch+ReadableStream）。
+
+Story 2.5 观测增强（流式特性）
+As an operator,
+I want streaming-focused observability,
+so that we can monitor and improve reliability.
+
+验收标准
+1: 指标覆盖：SSE 成功率、断流率、首字节时间（TTFB-Streaming）、平均事件间隔、重试次数分布。
+2: 记录必要元数据，不存正文；保留期遵守 30 天默认策略。
+3: 提供最小化仪表盘定义或查询示例（便于后续可视化）。
+
+Story 2.6 集成与回归测试（流式）
+As a QA engineer,
+I want automated streaming tests,
+so that regressions are caught early.
+
+验收标准
+1: 提供端到端流式测试：正常、慢上游、间歇上游、断流、重试、不可恢复错误。
+2: 覆盖首字节时间、事件完整性、回压稳定性等关键指标的断言或阈值检查。
+3: 在 CI 中运行可控的子集（长时间场景可放入夜间/增量测试）。
+
+Story 2.7 文档与示例（流式）
+As a tenant developer,
+I want clear docs and samples for streaming,
+so that I can implement clients correctly.
+
+验收标准
+1: 提供浏览器（EventSource）与 Node（Fetch+ReadableStream）的最小示例。
+2: 文档包含错误模型映射、重连/超时/心跳策略的推荐实践与权衡。
+3: 提供问题排查清单（常见断流原因、上游/网络/客户端差异）。
+
+## 7. Epic Details — Epic 3: Account Health & Circuit Breaker
+
+Epic 目标
+- 设计并落地 D1 表结构与核心读写路径（账号、健康历史、失败计数、禁用窗口、恢复时间等）。
+- 实现账号健康检测、熔断与指数退避恢复策略。
+- 引入 Queues 处理异步健康检查与重试，避免请求热路径阻塞。
+- 提供可观测指标，量化健康度与恢复速度，支撑容量与成本决策。
+
+Story 3.1 D1 表结构与读写 API
+As a platform operator,
+I want relational tables for account states and health history,
+so that I can persist, query, and audit health data reliably.
+
+验收标准
+1: 设计并创建核心表：`accounts`、`health_events`、`routing_bindings`（账号-地域/出口IP 绑定）、`throttles`（可选）。
+2: 提供读写 API：记录失败/成功事件、更新失败计数、设置禁用窗口、记录恢复时间。
+3: 提供索引与查询样例：按账号/地域/时间窗口查询健康趋势；审计最近 N 次事件。
+
+Story 3.2 健康检测与熔断策略（同步路径）
+As a reliability engineer,
+I want on-path health updates and circuit breaking,
+so that failing accounts are quickly isolated.
+
+验收标准
+1: 在请求失败时按错误类型更新健康计数；达到阈值→触发熔断，进入禁用窗口。
+2: 对不可恢复错误（如认证失败）立即熔断并延长禁用窗口；对可恢复错误采用较短窗口。
+3: 同步路径尽量轻量：仅打标与入队任务，不进行重型计算。
+
+Story 3.3 指数退避与恢复（异步路径）
+As a system,
+I want backoff-based recovery via queues,
+so that accounts return to pool safely.
+
+验收标准
+1: 使用 Queues 定期探测被熔断账号；指数退避（如 1m → 2m → 4m → … 上限）后执行轻量健康探测。
+2: 探测成功→清零失败计数、退出熔断；失败→继续退避并延长窗口（设上限以防抖动）。
+3: 可配置最大退避上限与总探测次数；提供默认合理值。
+
+Story 3.4 路由与账号选择策略（与固定 IP 绑定协同）
+As a request router,
+I want to avoid unhealthy accounts and respect bindings,
+so that routing remains compliant and efficient.
+
+验收标准
+1: 选择账号时跳过“熔断/禁用中”的账号；优先选择健康度更高、绑定地域就近的账号。
+2: 遵守“账号:固定IP=1:N（小 N 冗余）”策略，不跨账号共享 IP。
+3: 记录路由决策元数据用于审计（不含正文）。
+
+Story 3.5 观测指标与告警
+As an operator,
+I want KPIs and alerts for account health,
+so that I can detect issues early.
+
+验收标准
+1: 指标覆盖：失败率、熔断触发次数、平均禁用时长、恢复成功率、恢复平均时间（MTTR）。
+2: 阈值示例与告警规则占位（文档化）：如熔断频率异常升高时提醒。
+3: 仅记录必要元数据，遵守 30 天保留与隐私约束。
+
+Story 3.6 集成测试与回归场景
+As a QA engineer,
+I want automated tests for health and recovery,
+so that regressions are minimized.
+
+验收标准
+1: 覆盖：连续失败触发熔断、禁用窗口内拒绝路由、退避后恢复、上限退避、不可恢复错误快速熔断。
+2: 覆盖路由选择跳过不健康账号、选择健康账号的逻辑。
+3: 在 CI 中运行需时可控的子集，长场景可夜间运行。
+
+Story 3.7 运维与运营手册
+As an oncall engineer,
+I want operational playbooks,
+so that incidents are resolved quickly.
+
+验收标准
+1: 提供常见故障场景与处置流程（如大量账号熔断、单地域异常、绑定策略冲突）。
+2: 提供调试/手动解禁/强制禁用的安全流程（带审计记录）。
+3: 提供 D1 表结构变更与数据维护注意事项清单。
+
+## 8. Epic Details — Epic 4: Regional Egress & Fixed IP Strategy
+
+Epic 目标
+- 集成固定出口 IP 代理集群，优先新加坡地域，其后法兰克福/达拉斯。
+- 落地“账号:固定IP=1:N（小 N 冗余）”绑定，不跨账号共享 IP。
+- 按地域就近接入，结合健康度与配额进行路由选择。
+- 建立可观测指标与运维流程，确保透明度与快速处置能力。
+
+Story 4.1 出口代理集群对接与基础连通性
+As a network integrator,
+I want the relay to route via fixed-IP egress clusters,
+so that upstream sees stable, controlled IPs.
+
+验收标准
+1: 与至少 1 个地域（新加坡）固定 IP 集群打通出站线路，具备健康检测（连通、时延、丢包占位）。
+2: 提供可配置的出站代理参数（地址、端口、认证、地域标签、权重）。
+3: 在非生产环境验证最小 JSON Relay 通过固定 IP 正常转发。
+
+Story 4.2 账号-固定 IP 绑定策略
+As a compliance-focused operator,
+I want one-to-N bindings between account and fixed IPs,
+so that accounts never share IPs across boundaries.
+
+验收标准
+1: 设计并持久化“账号:固定IP=1:N（小 N 冗余）”绑定（D1 表或配置来源），不跨账号共享。
+2: 绑定变更需审计记录与最小变更日志；支持安全的回滚处理。
+3: 单账号的 N 个 IP 具备优先/降级策略（健康/可用性优先）。
+
+Story 4.3 地域就近接入与路由决策
+As a request router,
+I want region-aware routing,
+so that latency and success rate improve.
+
+验收标准
+1: 根据请求地域提示（如 `RELAY_REGION_HINT`）优先选择对应地域集群；无提示则按全局最优策略选择。
+2: 结合账号健康度、配额与绑定策略进行综合路由；不可用时执行降级路径（同地域备选 → 相邻地域）。
+3: 记录路由决策元数据（不含正文）便于审计与回溯。
+
+Story 4.4 故障与降级策略（地域/出口层）
+As an SRE,
+I want safe degradation paths,
+so that incidents don’t cascade to users.
+
+验收标准
+1: 出口集群部分不可用时自动降级到同账号的备用 IP 或相邻地域；提供停用/启用开关。
+2: 与账号健康熔断联动，避免将请求发往“熔断/禁用”的账号或其绑定 IP。
+3: 文档化常见故障与降级流程（代理证书失效、线路异常、带宽饱和）。
+
+Story 4.5 观测与合规审计
+As an operator,
+I want visibility and audit trails,
+so that decisions are explainable and compliant.
+
+验收标准
+1: 指标覆盖：地域分布成功率、出口 IP 成功率、切换/降级次数、平均路由决策时间。
+2: 审计：记录账号-固定 IP 的变更日志，路由决策摘要（不含正文），可按时间范围查询。
+3: 仅记录必要元数据，遵守 30 天保留与隐私约束。
+
+Story 4.6 性能与稳定性验证
+As a QA/perf engineer,
+I want performance and stability tests,
+so that region-based routing is reliable.
+
+验收标准
+1: 不同地域的延迟/稳定性对比测试；验证就近接入的收益（如 P95 延迟改善）。
+2: 断链/降速/丢包等网络条件下，验证降级策略与可用性目标。
+3: 在 CI/夜间任务运行部分性能回归，确保关键路径不回退。
+
+Story 4.7 运维与容量规划
+As an oncall/capacity planner,
+I want runbooks and capacity models,
+so that scaling decisions are data-driven.
+
+验收标准
+1: 产出地域与出口集群的容量模型与扩容判据（示例阈值）。
+2: 提供变更 SOP：新增 IP、替换 IP、调节地域权重、临时封禁。
+3: 明确安全依赖（证书/认证）轮转流程与检查清单。
+
+## 9. Epic Details — Epic 5: Tenant Controls & Onboarding
+
+Epic 目标
+- 提供租户级并发/配额与用量观测的基础能力。
+- 建立 API Key 生命周期管理与最小化的租户自助接口。
+- 输出最小可用的 Onboarding 文档/示例或 SDK，确保集成 ≤ 0.5 天。
+- 形成基本运营/支持闭环（常见问题、排查清单、用量可视）。
+
+Story 5.1 租户模型与 API Key 生命周期
+As a tenant admin,
+I want to manage tenant and API keys,
+so that onboarding and key rotation are safe and simple.
+
+验收标准
+1: 定义租户模型（tenant_id、状态、创建时间、备注）与 API Key 模型（key_id、哈希/前缀、状态、创建/失效时间、备注）。
+2: 提供最小生命周期操作：创建、禁用、旋转、列出；关键操作有审计记录（不存明文）。
+3: 文档化密钥管理最佳实践（定期轮换、最小权限、最小分发）。
+
+Story 5.2 配额与并发控制（租户级）
+As a platform operator,
+I want tenant-level quotas and concurrency limits,
+so that usage remains controlled and predictable.
+
+验收标准
+1: 可配置租户级请求配额、并发上限、速率限制；超限返回统一错误（含追踪 ID）。
+2: 提供重置/调整入口（仅运维权限），并记录审计变更。
+3: 在集成测试中覆盖正常/超限/恢复场景，并与现有 KV 限流机制整合。
+
+Story 5.3 用量计量与基础可观测
+As a tenant admin,
+I want usage metrics visibility,
+so that I can understand consumption and troubleshoot.
+
+验收标准
+1: 记录并可查询租户级用量元数据（调用数、成功率、P95 延迟、流式成功率等），遵守“仅记录元数据、不存正文”与 30 天保留。
+2: 提供最小查询接口或导出能力（例如租户自助查询近 7/30 天摘要）。
+3: 提供示例查询/仪表盘定义占位，便于后续可视化。
+
+Story 5.4 Onboarding 文档与最小 SDK/示例
+As a tenant developer,
+I want simple onboarding docs or SDK,
+so that I can integrate within 0.5 day.
+
+验收标准
+1: 提供最小 Postman 集合或 SDK 片段（语言可选 TypeScript/JS），涵盖鉴权、JSON 调用、流式示例、常见错误处理。
+2: 提供“接入 30 分钟路径”：环境变量、鉴权、最小请求、错误模型、流式读取的示例。
+3: 提供“常见问题与排查”清单，覆盖密钥失败、超限、上游断流、区域路由提示等。
+
+Story 5.5 租户自助与运维接口（最小集）
+As an operator,
+I want minimal self-serve and admin endpoints,
+so that tenants and ops can act without tickets for basics.
+
+验收标准
+1: 租户自助：查看用量摘要、查看/禁用/旋转 API Key、获取接入示例链接。
+2: 运维接口：调整租户配额/并发、临时封禁/解禁租户、导出近 N 天用量摘要。
+3: 所有敏感操作均需鉴权并有审计记录，遵循最小权限。
+
+Story 5.6 合规与隐私（租户层）
+As a compliance-minded stakeholder,
+I want guardrails for privacy and compliance,
+so that tenant operations remain safe.
+
+验收标准
+1: 再申明“仅记录元数据，不存正文”的约束；明确可配置的保留周期（默认 30 天）。
+2: 在对外文档中明确与上游条款/地域策略的关系与边界指引。
+3: 提供导出与删除租户元数据的流程（运维侧），留存审计记录。
+
+Story 5.7 试点租户上线与回访
+As a product manager,
+I want pilot tenants activated and reviewed,
+so that we capture feedback and validate MVP.
+
+验收标准
+1: 选择 2-3 个目标试点租户，完成 Onboarding，达成首周使用目标（如日均调用数、成功率、流式占比）。
+2: 回访收集集成体验、问题与改进建议，更新“常见问题与排查”与文档。
+3: 根据反馈评估是否提前引入 Epic 2/3/4 的部分能力或调整优先级。
+
+## 10. Next Steps（下一步）
+
+### UX Expert Prompt（占位）
+请基于本 PRD 提炼最小化的用户流程与信息架构建议，不做详细 UI 规范，重点：
+- 关键交互点（鉴权失败、超限、流式加载反馈）的用户提示策略；
+- 文档/示例的可读性与“30 分钟接入路径”的信息组织；
+- 如未来提供控制台，自助入口的信息架构草图与权限边界建议。
+
+### Architect Prompt（占位）
+请基于本 PRD 制定技术落地方案与分层设计，要求：
+- 给出 Workers/KV/D1/Queues 的目录与模块划分、核心接口定义草案；
+- 定义错误模型与流式透传的关键数据结构与状态机；
+- 制定健康/熔断/退避与地域路由的协同流程图；
+- 产出 M1（Epic 1）与 M2（Epic 2）的交付件清单与上线检查表。
